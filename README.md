@@ -1,64 +1,98 @@
-<div align="center">
+# Tachyon
 
-<h1>
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="logo_dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="logo_light.svg">
-  <img alt="Helix" height="128" src="logo_light.svg">
-</picture>
-</h1>
+Tachyon is a semantic editing layer derived from the [Helix Editor](https://github.com/helix-editor/helix)
+codebase. It keeps Helix's kernel — modal editing, multiple selections,
+tree-sitter integration, built-in language-server support — and adds a
+target-first semantic grammar on top of it:
 
-[![Build status](https://github.com/helix-editor/helix/actions/workflows/build.yml/badge.svg)](https://github.com/helix-editor/helix/actions)
-[![GitHub Release](https://img.shields.io/github/v/release/helix-editor/helix)](https://github.com/helix-editor/helix/releases/latest)
-[![Documentation](https://shields.io/badge/-documentation-452859)](https://docs.helix-editor.com/)
-[![GitHub contributors](https://img.shields.io/github/contributors/helix-editor/helix)](https://github.com/helix-editor/helix/graphs/contributors)
-[![Matrix Space](https://img.shields.io/matrix/helix-community:matrix.org)](https://matrix.to/#/#helix-community:matrix.org)
+    t [count] [direction] <target> <action>
 
-</div>
+The model is one algebra:
 
-![Screenshot](./screenshot.png)
+    TARGET × COUNT × DIRECTION × ACTION × REPEAT × CURRENT TREE
 
-A [Kakoune](https://github.com/mawww/kakoune) / [Neovim](https://github.com/neovim/neovim) inspired editor, written in Rust.
+Every operation resolves against the tree-sitter parse of the **current**
+document. Persistent repeat state holds intent only — never selections,
+ranges, positions, or tree-sitter nodes.
 
-The editing model is very heavily based on Kakoune; during development I found
-myself agreeing with most of Kakoune's design decisions.
+## Examples
 
-For more information, see the [website](https://helix-editor.com) or
-[documentation](https://docs.helix-editor.com/).
+```text
+t ?        open the prefix-aware Explorer (discover targets/actions live)
+t f d      delete the current function
+t 3 f d    delete three functions
+t -2 f y   yank the two previous functions
+t -n d     delete the previous parameter (separator repaired)
+t -2 n d . delete the previous two parameters, then repeat on the current tree
+t 2 s c    counted Change through Helix's native multi-cursor insert
+```
 
-All shortcuts/keymaps can be found [in the documentation on the website](https://docs.helix-editor.com/keymap.html).
+`t -2 n d` combines semantic parameter selection, backward traversal, count,
+delimiter repair, multiline/CRLF correctness, current-tree semantics and
+transaction-safe multi-range application — a composition with no direct Vim
+operator equivalent. Because resolution is grammar-driven, the same commands
+work identically across Rust, Python, Go, C, and other languages whose
+tree-sitter queries expose the standard captures.
 
-[Troubleshooting](https://github.com/helix-editor/helix/wiki/Troubleshooting)
+## Semantics
 
-# Features
+- **Count** multiplies semantic scope (`t 3 f d`). Count `0` is rejected.
+- **Direction**: leading `-` selects backward traversal (`t -3 f d`); results
+  stay document-ordered.
+- **Repeat** (`.`) replays `(Target, Action, count, Direction)` intent against
+  the **current** document — mutation between repeats is honored, stale
+  geometry is never replayed.
+- **Counted Change** clears N targets and opens one multi-cursor insert
+  session (one cursor per target).
+- **Delimiter-aware Parameter deletion** repairs surrounding separators, is
+  multiline-safe, and handles both LF and CRLF line endings.
 
-- Vim-like modal editing
-- Multiple selections
-- Built-in language server support
-- Smart, incremental syntax highlighting and code editing via tree-sitter
+## Targets
 
-Although it's primarily a terminal-based editor, I am interested in exploring
-a custom renderer (similar to Emacs) using wgpu.
+| Target | Resolution |
+|---|---|
+| `f` function · `g` class · `n` parameter | tree-sitter captures (`@function.inside`, `@class.inside`, `@parameter.inside`) |
+| `e` expression · `s` statement · `b` block | documented fallback when the grammar exposes no capture — never fabricated |
+| `(` argument · `"` string · `%` brackets · `w` word · `l` line · `p` paragraph · `a` all | text primitives |
 
-Note: Only certain languages have indentation definitions at the moment. Check
-`runtime/queries/<lang>/` for `indents.scm`.
+Actions: `d` delete · `c` change · `y` yank · `>` indent · `<` outdent.
 
-# Installation
+Press `t ?` at any time to browse every target and action with the active
+prefix displayed.
 
-[Installation documentation](https://docs.helix-editor.com/install.html).
+## Building
 
-[![Packaging status](https://repology.org/badge/vertical-allrepos/helix-editor.svg?exclude_unsupported=1)](https://repology.org/project/helix-editor/versions)
+```sh
+cargo install --path helix-term --locked   # installs the `hx` binary
+```
 
-# Contributing
+Requires Rust 1.90.0 (see `rust-toolchain.toml`). Grammars are compiled on
+first run.
 
-Contributing guidelines can be found [here](./docs/CONTRIBUTING.md).
+## Testing
 
-# Getting help
+```sh
+cargo test --workspace
+cargo test -p helix-term --features integration --test integration tachyon
+```
 
-Your question might already be answered on the [FAQ](https://github.com/helix-editor/helix/wiki/FAQ).
+Release `v25.7.1-tachyon.1` ships with a green workspace run, real-tree
+verification across four bundled grammars (Rust, Python, Go, C), and
+real-dispatch integration smoke tests covering the Explorer flow, backward
+counted parameter deletion with repeat, and counted Change.
 
-Discuss the project on the community [Matrix Space](https://matrix.to/#/#helix-community:matrix.org) (make sure to join `#helix-editor:matrix.org` if you're on a client that doesn't support Matrix Spaces yet).
+## Project status
 
-# Credits
+Semantic core is released as `v25.7.1-tachyon.1`. Documentation under
+`docs/` and `book/` describes the inherited Helix base and remains the
+reference for editor features outside the Tachyon semantic layer.
 
-Thanks to [@jakenvac](https://github.com/jakenvac) for designing the logo!
+## Origin / Attribution
+
+Tachyon is derived from the Helix Editor codebase:
+[helix-editor/helix](https://github.com/helix-editor/helix).
+
+Helix is licensed under the Mozilla Public License 2.0; see
+[LICENSE](./LICENSE). All upstream copyright holders and license obligations
+remain intact. Tachyon is an independent project and is **not** affiliated
+with, endorsed by, or maintained by the Helix project or its contributors.
