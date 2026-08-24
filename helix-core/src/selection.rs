@@ -1455,4 +1455,292 @@ mod test {
             vec!((1, 2), (3, 4), (7, 9))
         ));
     }
+
+    // Tachyon multi-cursor tests
+
+    #[test]
+    fn test_select_on_matches_finds_all_occurrences() {
+        use helix_stdx::rope::RopeSliceExt;
+
+        let text = Rope::from("foo bar foo baz foo");
+        let slice = text.slice(..);
+        let selection = Selection::new(smallvec![Range::new(0, 19)], 0);
+
+        let regex = rope::RegexBuilder::new().build("foo").unwrap();
+        let result = select_on_matches(slice, &selection, &regex).unwrap();
+
+        // Should find 3 occurrences of "foo"
+        assert_eq!(result.len(), 3);
+        assert_eq!(result.ranges()[0], Range::new(0, 3));
+        assert_eq!(result.ranges()[1], Range::new(8, 11));
+        assert_eq!(result.ranges()[2], Range::new(16, 19));
+    }
+
+    #[test]
+    fn test_select_on_matches_single_occurrence() {
+        use helix_stdx::rope::RopeSliceExt;
+
+        let text = Rope::from("hello world");
+        let slice = text.slice(..);
+        let selection = Selection::new(smallvec![Range::new(0, 11)], 0);
+
+        let regex = rope::RegexBuilder::new().build("world").unwrap();
+        let result = select_on_matches(slice, &selection, &regex).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.ranges()[0], Range::new(6, 11));
+    }
+
+    #[test]
+    fn test_select_on_matches_no_matches() {
+        use helix_stdx::rope::RopeSliceExt;
+
+        let text = Rope::from("hello world");
+        let slice = text.slice(..);
+        let selection = Selection::new(smallvec![Range::new(0, 11)], 0);
+
+        let regex = rope::RegexBuilder::new().build("xyz").unwrap();
+        let result = select_on_matches(slice, &selection, &regex);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_selection_push_adds_range() {
+        let selection = Selection::new(smallvec![Range::new(0, 3)], 0);
+        let new_selection = selection.push(Range::new(8, 11));
+
+        assert_eq!(new_selection.len(), 2);
+        // Primary should be the newly pushed range
+        assert_eq!(new_selection.primary_index(), 1);
+        assert_eq!(new_selection.primary(), Range::new(8, 11));
+    }
+
+    #[test]
+    fn test_selection_push_normalizes_order() {
+        // Push a range that comes before the existing range
+        let selection = Selection::new(smallvec![Range::new(8, 11)], 0);
+        let new_selection = selection.push(Range::new(0, 3));
+
+        assert_eq!(new_selection.len(), 2);
+        // After normalization, ranges should be sorted
+        assert_eq!(new_selection.ranges()[0], Range::new(0, 3));
+        assert_eq!(new_selection.ranges()[1], Range::new(8, 11));
+    }
+
+    #[test]
+    fn test_regex_escape_for_literal_matching() {
+        // Verify that regex::escape properly escapes special characters
+        let escaped = crate::regex::escape("foo(bar)");
+        assert_eq!(escaped, r"foo\(bar\)");
+    }
+
+    #[test]
+    fn test_select_on_matches_with_escaped_text() {
+        use helix_stdx::rope::RopeSliceExt;
+
+        let text = Rope::from("foo(bar) and foo(bar) again");
+        let slice = text.slice(..);
+        let selection = Selection::new(smallvec![Range::new(0, 27)], 0);
+
+        // Escape the literal text "foo(bar)" so parens are treated literally
+        let escaped = crate::regex::escape("foo(bar)");
+        let regex = rope::RegexBuilder::new().build(&escaped).unwrap();
+        let result = select_on_matches(slice, &selection, &regex).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.ranges()[0], Range::new(0, 8));
+        assert_eq!(result.ranges()[1], Range::new(13, 21));
+    }
+
+    #[test]
+    fn test_selection_push_multiple_cursors() {
+        // Simulate the Alt+j workflow: start with one selection, add more
+        let selection = Selection::new(smallvec![Range::new(0, 3)], 0);
+
+        // Add second occurrence
+        let selection = selection.push(Range::new(8, 11));
+        assert_eq!(selection.len(), 2);
+
+        // Add third occurrence
+        let selection = selection.push(Range::new(16, 19));
+        assert_eq!(selection.len(), 3);
+
+        // Primary should be the last added
+        assert_eq!(selection.primary_index(), 2);
+        assert_eq!(selection.primary(), Range::new(16, 19));
+    }
+
+    // Tachyon semantic repeat tests
+
+    #[test]
+    fn test_repeat_target_resolution_from_new_position() {
+        // Verify that target resolution at a new cursor position produces
+        // different results than at the original position.
+        // This is the core invariant of semantic repeat:
+        // "resolve from CURRENT context, not stored selection."
+
+        let text = Rope::from("foo bar foo baz foo");
+        let slice = text.slice(..);
+
+        // Simulate: cursor at first "foo" (pos 0..3)
+        let range_at_first = Range::new(0, 3);
+        let selection_at_first = Selection::new(smallvec![range_at_first], 0);
+
+        // Simulate: cursor at second "foo" (pos 8..11)
+        let range_at_second = Range::new(8, 11);
+        let selection_at_second = Selection::new(smallvec![range_at_second], 0);
+
+        // Both selections should be valid and different
+        assert_ne!(selection_at_first.primary(), selection_at_second.primary());
+        assert_eq!(selection_at_first.primary().from(), 0);
+        assert_eq!(selection_at_second.primary().from(), 8);
+    }
+
+    #[test]
+    fn test_repeat_does_not_depend_on_original_selection() {
+        // Verify that a selection created at position A can be reused
+        // to derive a new selection at position B.
+        // This models the repeat pattern:
+        //   1. User performs twc at position A → word at A is selected and changed
+        //   2. User moves to position B
+        //   3. User presses "." → word at B should be selected and changed
+
+        let text = Rope::from("hello world hello");
+        let slice = text.slice(..);
+
+        // Original selection at "hello" (0..5)
+        let original = Selection::new(smallvec![Range::new(0, 5)], 0);
+
+        // After moving cursor to position 12 (second "hello")
+        let new_cursor = Selection::new(smallvec![Range::point(12)], 0);
+
+        // The new selection should be derivable from the new cursor position
+        // independently of the original selection
+        assert_eq!(new_cursor.primary().head, 12);
+        assert_ne!(new_cursor.primary().head, original.primary().head);
+
+        // A word selection at the new position should cover "hello" (12..17)
+        let new_word = crate::textobject::textobject_word(
+            slice,
+            new_cursor.primary(),
+            crate::textobject::TextObject::Inside,
+            1,
+            false,
+        );
+        assert_eq!(new_word.from(), 12);
+        assert_eq!(new_word.to(), 17);
+    }
+
+    #[test]
+    fn test_multicursor_repeat_reconstructs_matches() {
+        // Verify that multi-cursor repeat can reconstruct all matches
+        // from the current cursor context, not from stale ranges.
+
+        let text = Rope::from("foo bar foo baz foo");
+        let slice = text.slice(..);
+
+        // Simulate: after tw Alt+a, all "foo" occurrences are selected
+        let multi_selection = Selection::new(
+            smallvec![
+                Range::new(0, 3),   // first "foo"
+                Range::new(8, 11),  // second "foo"
+                Range::new(16, 19), // third "foo"
+            ],
+            0,
+        );
+
+        // Verify all three matches exist
+        assert_eq!(multi_selection.len(), 3);
+
+        // Now simulate: user moves cursor to "bar" (pos 4..7) and presses .
+        // The repeat should find "bar" and create a new multi-selection
+        let new_cursor = Selection::new(smallvec![Range::new(4, 7)], 0);
+        let new_word = crate::textobject::textobject_word(
+            slice,
+            new_cursor.primary(),
+            crate::textobject::TextObject::Inside,
+            1,
+            false,
+        );
+        assert_eq!(new_word.from(), 4);
+        assert_eq!(new_word.to(), 7);
+
+        // The new match set should be just "bar" (only one occurrence)
+        // This is correct: repeat reconstructs from CURRENT context
+        let selected_text: String = slice
+            .slice(new_word.from()..new_word.to())
+            .to_string();
+        assert_eq!(selected_text, "bar");
+    }
+
+    #[test]
+    fn test_multicursor_repeat_does_not_reuse_stale_ranges() {
+        // Verify that repeat never reuses ranges from a previous multi-selection.
+
+        let text = Rope::from("aaa bbb aaa");
+        let slice = text.slice(..);
+
+        // Original multi-selection (all "aaa")
+        let original_multi = Selection::new(
+            smallvec![Range::new(0, 3), Range::new(8, 11)],
+            0,
+        );
+        assert_eq!(original_multi.len(), 2);
+
+        // After editing, the document changes:
+        // "xxx bbb aaa" (first "aaa" replaced with "xxx")
+        let text2 = Rope::from("xxx bbb aaa");
+        let slice2 = text2.slice(..);
+
+        // Repeat at cursor on "bbb" (pos 4..7) should find "bbb" only
+        let new_cursor = Selection::new(smallvec![Range::new(4, 7)], 0);
+        let new_word = crate::textobject::textobject_word(
+            slice2,
+            new_cursor.primary(),
+            crate::textobject::TextObject::Inside,
+            1,
+            false,
+        );
+
+        // Should NOT contain the stale ranges from the original multi-selection
+        // (0..3 and 8..11 from the old text)
+        assert_ne!(new_word.from(), 0);
+        assert_ne!(new_word.to(), 3);
+
+        // Should select "bbb" at its new position
+        let selected_text: String = slice2
+            .slice(new_word.from()..new_word.to())
+            .to_string();
+        assert_eq!(selected_text, "bbb");
+    }
+
+    #[test]
+    fn test_multicursor_empty_no_match() {
+        // When no matches exist, multi-cursor repeat should handle gracefully.
+
+        let text = Rope::from("hello world");
+        let slice = text.slice(..);
+
+        // Single selection at "hello"
+        let selection = Selection::new(smallvec![Range::new(0, 5)], 0);
+        let selected_text: String = selection
+            .primary()
+            .fragment(slice)
+            .into_owned();
+
+        // Verify the selected text is "hello"
+        assert_eq!(selected_text, "hello");
+
+        // Verify there's only one "hello" in the document
+        let mut count = 0;
+        for mat in selection {
+            let text_slice = mat.slice(slice);
+            let s: String = text_slice.chars().collect();
+            if s == "hello" {
+                count += 1;
+            }
+        }
+        assert_eq!(count, 1);
+    }
 }

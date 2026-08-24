@@ -11,9 +11,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
         "k" | "up" => move_visual_line_up,
         "l" | "right" => move_char_right,
 
-        "t" => find_till_char,
         "f" => find_next_char,
-        "T" => till_prev_char,
         "F" => find_prev_char,
         "r" => replace,
         "R" => replace_with_yanked,
@@ -93,7 +91,9 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
         "A-n" | "A-right" => select_next_sibling,
         "A-e" => move_parent_node_end,
         "A-b" => move_parent_node_start,
-        "A-a" => select_all_siblings,
+        "A-a" => select_all_matching,
+        "A-j" => add_selection_below_match,
+        "A-k" => add_selection_above_match,
 
         "%" => select_all,
         "x" => extend_line_below,
@@ -359,9 +359,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
         "n" => extend_search_next,
         "N" => extend_search_prev,
 
-        "t" => extend_till_char,
         "f" => extend_next_char,
-        "T" => extend_till_prev_char,
         "F" => extend_prev_char,
 
         "home" => extend_to_line_start,

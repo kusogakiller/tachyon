@@ -408,6 +408,12 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         }
     }
 
+    /// Set the prompt prefix text displayed at the bottom of the picker.
+    /// Used by the Tachyon Explorer to show the active semantic prefix.
+    pub fn set_prompt(&mut self, prefix: &str) {
+        self.prompt.set_prefix(prefix);
+    }
+
     pub fn truncate_start(mut self, truncate_start: bool) -> Self {
         self.truncate_start = truncate_start;
         self

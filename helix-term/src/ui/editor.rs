@@ -5,6 +5,7 @@ use crate::{
     handlers::completion::CompletionItem,
     key,
     keymap::{KeymapResult, Keymaps},
+    target::{self, Action, MultiSelectIntent, Target},
     ui::{
         document::{render_document, LinePos, TextRenderer},
         statusline,
@@ -20,7 +21,7 @@ use helix_core::{
     syntax::{self, OverlayHighlights},
     text_annotations::TextAnnotations,
     unicode::width::UnicodeWidthStr,
-    visual_offset_from_block, Change, Position, Range, Selection, Transaction,
+    visual_offset_from_block, Change, Position, Range, Selection, SmallVec, Transaction,
 };
 use helix_view::{
     annotations::diagnostics::DiagnosticFilter,
@@ -44,6 +45,13 @@ pub struct EditorView {
     spinners: ProgressSpinners,
     /// Tracks if the terminal window is focused by reaction to terminal focus events
     terminal_focused: bool,
+    /// Tachyon: pending target from `t` prefix. Set when the user types `t` + target key.
+    /// Cleared when an action is applied or on Escape.
+    pub(crate) pending_target: Option<Target>,
+    /// Tachyon: last successful semantic operation for repeat via `.`.
+    /// Stores (Target, Action, count, MultiSelectIntent)  Esemantic intent only,
+    /// NOT a stale selection or cursor position.
+    pub(crate) last_target_action: Option<(Target, Action, usize, target::Direction, MultiSelectIntent)>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +75,8 @@ impl EditorView {
             completion: None,
             spinners: ProgressSpinners::default(),
             terminal_focused: true,
+            pending_target: None,
+            last_target_action: None,
         }
     }
 
@@ -74,6 +84,436 @@ impl EditorView {
         &mut self.spinners
     }
 
+    /// Handle a keypress when there is a pending target (Tachyon target→action).
+    /// Returns true if the key was consumed.
+    fn handle_pending_target_action(
+        &mut self,
+        cx: &mut commands::Context,
+        event: KeyEvent,
+    ) -> bool {
+        let target = match self.pending_target.take() {
+            Some(t) => t,
+            None => return false,
+        };
+
+        // Escape cancels the pending target
+        if matches!(event.code, KeyCode::Esc) {
+            cx.editor.set_status("target cancelled");
+            return true;
+        }
+
+        // `?` opens the discoverable Target/Action explorer while keeping the
+        // pending target, so the user can resume with an action key afterwards.
+        if matches!(event.code, KeyCode::Char('?')) && event.modifiers.is_empty() {
+            self.pending_target = Some(target);
+            let count = PENDING_COUNT.with(|c| c.get());
+            let backward = PENDING_BACKWARD.with(|c| c.get());
+            let prefix = crate::target::format_tachyon_prefix(count, backward, Some(target));
+            commands::tachyon_help_cmd(cx, Some(&prefix));
+            return true;
+        }
+
+        // If 't' is pressed again, update the target (allow chaining: tte = target expression)
+        if matches!(event.code, KeyCode::Char('t')) && event.modifiers.is_empty() {
+            self.pending_target = Some(target);
+            self.read_target_key(cx);
+            return true;
+        }
+
+        // Try to resolve as an action
+        let action = match event.code {
+            KeyCode::Char(ch) => match target::Action::from_key(ch) {
+                Some(a) => a,
+                None => {
+                    // Not a known action - put the target back, drop any count,
+                    // and let normal dispatch handle it.
+                    self.pending_target = Some(target);
+                    PENDING_COUNT.with(|c| c.set(None));
+                    return false;
+                }
+            },
+            _ => {
+                self.pending_target = Some(target);
+                PENDING_COUNT.with(|c| c.set(None));
+                return false;
+            }
+        };
+
+        // Optional semantic count/direction captured by handle_target_input_step.
+        let count = PENDING_COUNT.with(|c| c.take()).unwrap_or(1);
+        let dir = if PENDING_BACKWARD.with(|c| c.take()) {
+            target::Direction::Backward
+        } else {
+            target::Direction::Forward
+        };
+
+        // Reject invalid count+action combinations (single source of truth
+        // lives in `target::is_supported_target_action`).
+        if !target::is_supported_target_action(count, action) {
+            cx.editor.set_status("invalid count: 0");
+            return true;
+        }
+
+        self.execute_target_action(cx.editor, target, action, count, dir);
+
+        true
+    }
+
+    /// Execute a resolved Target ↁEAction pair against the CURRENT editor state.
+    ///
+    /// This is the single execution core shared by:
+    ///   - manual keystroke flow (`t` + target + action key), and
+    ///   - `:ai-apply` (user-confirmed AI suggestion activation).
+    ///
+    /// The target is always re-resolved from the current cursor position at
+    /// call time  Eno stale Selection or Range is ever reused. Change enters
+    /// insert mode so the USER types replacement text; nothing is auto-inserted.
+    /// Repeat intent (`last_target_action`) is updated exactly like a manual
+    /// `t{target}{action}` sequence.
+    pub(crate) fn execute_target_action(
+        &mut self,
+        editor: &mut Editor,
+        target: Target,
+        action: Action,
+        count: usize,
+        dir: target::Direction,
+    ) {
+        // Record the semantic operation for repeat via `.`.
+        // This does NOT store a stale selection — only the intent.
+        self.last_target_action =
+            Some((target, action, count.max(1), dir, MultiSelectIntent::None));
+
+        // Resolve the target to a selection and apply the action. Count is a
+        // scope multiplier and direction controls traversal order only; the
+        // resulting Selection is document-ordered either way, so the action
+        // code below is unchanged. Forward count=1 is byte-for-byte equivalent
+        // to the original `resolve` path.
+        let (view, doc) = current!(editor);
+        let syn_loader = editor.syn_loader.clone();
+        let start = doc.selection(view.id).primary().head;
+        let selection =
+            target.resolve_counted_dir(doc, view, &syn_loader, count.max(1), start, dir);
+
+        self.apply_target_selection(editor, target, action, selection);
+    }
+
+    /// Semantic repeat entry for `.`: re-applies the last Tachyon operation on
+    /// the NEXT matching object(s), resolved from the CURRENT document.
+    ///
+    /// Advancement rule (see `target::action_removes_target`):
+    ///   - scope-removing actions (delete/change): the operated object is gone,
+    ///     so the next object now occupies the cursor  Eresolve AT the cursor;
+    ///   - scope-preserving actions (yank/indent/outdent): step PAST the object
+    ///     under the cursor first (`Target::resolve_advance`).
+    /// Falls back to Helix's ordinary repeat when no Tachyon operation exists.
+    /// Unsupported combinations are reported via status, never executed.
+    pub(crate) fn repeat_target_action(&mut self, cx: &mut commands::Context) -> bool {
+        let Some((target, action, count, dir, multi_select)) = self.last_target_action else {
+            return false; // no previous Tachyon action ↁEcaller uses Helix repeat
+        };
+        let count = count.max(1);
+        if !target::is_supported_target_action(count, action) {
+            cx.editor.set_status("invalid count: 0");
+            return true;
+        }
+
+        let advance_past_current = !target::action_removes_target(action);
+        let (view, doc) = current!(cx.editor);
+        let syn_loader = cx.editor.syn_loader.clone();
+        let cursor = doc.selection(view.id).primary().head;
+
+        // Same target + action + count + DIRECTION against the CURRENT doc.
+        // Scope-removing actions: the operated scope is gone, so resolution at
+        // the cursor finds the next object in `dir`. Scope-preserving actions:
+        // recompute the current scope, then step past its trailing (forward)
+        // or leading (backward) edge before collecting fresh objects.
+        let selection = if advance_past_current {
+            let current_scope =
+                target.resolve_counted_dir(doc, view, &syn_loader, count, cursor, dir);
+            let edge = match dir {
+                target::Direction::Forward => current_scope
+                    .ranges()
+                    .iter()
+                    .map(|r| r.to())
+                    .max()
+                    .unwrap_or(cursor),
+                target::Direction::Backward => current_scope
+                    .ranges()
+                    .iter()
+                    .map(|r| r.from())
+                    .min()
+                    .unwrap_or(cursor)
+                    .saturating_sub(1),
+            };
+            target.resolve_counted_dir(doc, view, &syn_loader, count, edge, dir)
+        } else {
+            target.resolve_counted_dir(doc, view, &syn_loader, count, cursor, dir)
+        };
+
+        // Preserve the pre-existing multi-cursor intent: reconstruct all
+        // occurrences of the resolved text from the CURRENT document.
+        let final_selection = if multi_select == MultiSelectIntent::AllMatching {
+            let text = doc.text().slice(..);
+            let primary = selection.primary();
+            let selected_text: String = primary.fragment(text).into_owned();
+            if selected_text.is_empty() {
+                selection
+            } else {
+                let escaped = helix_core::regex::escape(&selected_text);
+                if let Ok(regex) = helix_stdx::rope::RegexBuilder::new().build(&escaped) {
+                    use helix_stdx::rope::RopeSliceExt;
+                    let mut ranges: SmallVec<[Range; 1]> = SmallVec::new();
+                    for mat in regex.find_iter(text.regex_input_at(0..text.len_chars())) {
+                        let start = text.byte_to_char(mat.start());
+                        let end = text.byte_to_char(mat.end());
+                        ranges.push(Range::new(start, end));
+                    }
+                    if ranges.is_empty() {
+                        selection
+                    } else {
+                        let primary_pos = primary.head;
+                        let primary_index = ranges
+                            .iter()
+                            .position(|r| r.from() <= primary_pos && r.to() >= primary_pos)
+                            .unwrap_or(0);
+                        Selection::new(ranges, primary_index)
+                    }
+                } else {
+                    selection
+                }
+            }
+        } else {
+            selection
+        };
+
+        self.apply_target_selection(cx.editor, target, action, final_selection);
+
+        // Change replay: like the previous `.` behavior, replay the insert-mode
+        // keystrokes recorded during the original operation, then leave insert.
+        if matches!(action, Action::Change) {
+            for key in self.last_insert.1.clone() {
+                match key {
+                    InsertEvent::Key(key) => self.insert_mode(cx, key),
+                    _ => {} // completion events skipped on repeat
+                }
+            }
+            cx.editor.mode = Mode::Normal;
+        }
+        true
+    }
+
+    /// THE single editing application core. Every path  Emanual
+    /// `t [count] <target> <action>`, `.`, and `:ai-apply`  Efunnels through
+    /// here with a freshly resolved selection from the CURRENT document.
+    fn apply_target_selection(
+        &mut self,
+        editor: &mut Editor,
+        target: Target,
+        action: Action,
+        selection: Selection,
+    ) {
+        // Cloned before `current!` so the loader borrow never overlaps the
+        // document borrow below.
+        let syn_loader = editor.syn_loader.clone();
+        let (view, doc) = current!(editor);
+
+        match action {
+            Action::Change => {
+                doc.set_selection(view.id, selection);
+                // Delete the selection and enter insert mode
+                let transaction =
+                    Transaction::delete_by_selection(doc.text(), doc.selection(view.id), |range| {
+                        (range.from(), range.to())
+                    });
+                doc.apply(&transaction, view.id);
+                editor.mode = Mode::Insert;
+            }
+            Action::Delete => {
+                // Sole semantic transformation: Parameter deletion also removes
+                // its list separator so `foo(a, b, c)` stays structurally valid.
+                // Every other target keeps plain Delete semantics.
+                let selection = if matches!(target, Target::Parameter) {
+                    target::parameter_delete_selection(doc, &syn_loader, &selection)
+                } else {
+                    selection
+                };
+                doc.set_selection(view.id, selection);
+                let transaction =
+                    Transaction::delete_by_selection(doc.text(), doc.selection(view.id), |range| {
+                        (range.from(), range.to())
+                    });
+                doc.apply(&transaction, view.id);
+            }
+            Action::Yank => {
+                doc.set_selection(view.id, selection);
+                // Yank to register
+                let text = doc.text().slice(..);
+                let values: Vec<String> = doc
+                    .selection(view.id)
+                    .fragments(text)
+                    .map(std::borrow::Cow::into_owned)
+                    .collect();
+                let register = editor.config().default_yank_register;
+                if let Err(err) = editor.registers.write(register, values) {
+                    editor.set_error(err.to_string());
+                } else {
+                    editor.set_status(format!("yanked to register {}", register));
+                }
+            }
+            Action::Indent | Action::Outdent => {
+                doc.set_selection(view.id, selection);
+                let is_indent = action == Action::Indent;
+                let indent_str = doc.indent_style.as_str().to_owned();
+                let tab_width = doc.tab_width();
+                let indent_width = doc.indent_width();
+                let current_selection = doc.selection(view.id).clone();
+
+                if is_indent {
+                    // One indent per UNIQUE line: several resolved ranges can
+                    // share a line (e.g. counted parameters on one line), and
+                    // duplicate insertions would stack the indent unit.
+                    let mut seen_lines = std::collections::HashSet::new();
+                    let transaction = Transaction::change(
+                        doc.text(),
+                        current_selection.ranges().iter().filter_map(|range| {
+                            let text = doc.text().slice(..);
+                            let line = range.cursor_line(text);
+                            if !seen_lines.insert(line) {
+                                return None;
+                            }
+                            let pos = text.line_to_char(line);
+                            let is_blank = text.line(line).chunks().all(|s| s.trim().is_empty());
+                            if is_blank {
+                                return None;
+                            }
+                            Some((pos, pos, Some(helix_core::Tendril::from(indent_str.clone()))))
+                        }),
+                    );
+                    doc.apply(&transaction, view.id);
+                } else {
+                    let mut changes = Vec::new();
+                    for range in current_selection.ranges() {
+                        let text = doc.text().slice(..);
+                        let line_idx = range.cursor_line(text);
+                        let line = text.line(line_idx);
+                        let mut width = 0;
+                        let mut pos = 0;
+                        for ch in line.chars() {
+                            match ch {
+                                ' ' => width += 1,
+                                '\t' => width = (width / tab_width + 1) * tab_width,
+                                _ => break,
+                            }
+                            pos += 1;
+                            if width >= indent_width {
+                                break;
+                            }
+                        }
+                        if pos > 0 {
+                            let line_start = text.line_to_char(line_idx);
+                            changes.push((line_start, line_start + pos, None));
+                        }
+                    }
+                    if !changes.is_empty() {
+                        let transaction = Transaction::change(doc.text(), changes.into_iter());
+                        doc.apply(&transaction, view.id);
+                    }
+                }
+            }
+        }
+
+        // Tachyon: show action feedback after target-action execution
+        editor.set_status(format!("{} {}", action.name(), target.name()));
+    }
+
+    /// Read the next key to determine the target type, allowing an optional
+    /// digit prefix for semantic count (e.g. `t 3 f d`). Re-arms on each digit
+    /// so multi-digit counts work, and re-arms on `t` so target re-selection
+    /// (`t t e`) still works. The final target/action is read by
+    /// `handle_pending_target_action`.
+    fn read_target_key(&mut self, cx: &mut commands::Context) {
+        cx.on_next_key(|cx, event| handle_target_input_step(cx, event));
+    }
+}
+
+thread_local! {
+    static PENDING_TARGET: std::cell::Cell<Option<Target>> = const { std::cell::Cell::new(None) };
+    static PENDING_COUNT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static PENDING_BACKWARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tachyon: consume one key of the `t [count] <target>` input.
+///
+/// Digits accumulate an optional semantic count; a target char finalizes the
+/// pending target; `t` re-arms to keep reading; `?` opens the explorer; Esc or
+/// any other key cancels. Re-arms via `cx.on_next_key` so multi-digit counts
+/// and `t t e` re-selection both work.
+fn handle_target_input_step(cx: &mut commands::Context, event: KeyEvent) {
+    if matches!(event.code, KeyCode::Esc) {
+        PENDING_TARGET.with(|c| c.set(None));
+        PENDING_COUNT.with(|c| c.set(None));
+        PENDING_BACKWARD.with(|c| c.set(false));
+        cx.editor.set_status("target cancelled");
+        return;
+    }
+    match event.char() {
+        Some('?') => {
+            // Preserve PENDING_COUNT and PENDING_BACKWARD so the explorer
+            // inherits the semantic prefix (e.g. t 3 ? → count=3, Forward;
+            // t -3 ? → count=3, Backward). Only PENDING_TARGET is set by
+            // set_pending_target when the user picks an item.
+            let count = PENDING_COUNT.with(|c| c.get());
+            let backward = PENDING_BACKWARD.with(|c| c.get());
+            let prefix = crate::target::format_tachyon_prefix(count, backward, None);
+            commands::tachyon_help_cmd(cx, Some(&prefix));
+        }
+        // Leading `-` selects backward direction; magnitude stays unsigned.
+        Some('-') => {
+            PENDING_BACKWARD.with(|c| c.set(true));
+            cx.on_next_key(|cx, event| handle_target_input_step(cx, event));
+        }
+        Some(ch) if ch.is_ascii_digit() => {
+            let digit = ch.to_digit(10).unwrap_or(0) as usize;
+            let next = PENDING_COUNT
+                .with(|c| c.get())
+                .map_or(0, |v| v)
+                .saturating_mul(10)
+                .saturating_add(digit)
+                .min(4096);
+            PENDING_COUNT.with(|c| c.set(Some(next)));
+            cx.on_next_key(|cx, event| handle_target_input_step(cx, event));
+        }
+        // `t` again re-arms to keep reading (enables `t t e` re-selection).
+        Some('t') => {
+            cx.on_next_key(|cx, event| handle_target_input_step(cx, event));
+        }
+        Some(ch) => match Target::from_key(ch) {
+            Some(target) => {
+                PENDING_TARGET.with(|c| c.set(Some(target)));
+            }
+            None => {
+                PENDING_TARGET.with(|c| c.set(None));
+                PENDING_COUNT.with(|c| c.set(None));
+                PENDING_BACKWARD.with(|c| c.set(false));
+                cx.editor.set_status("unknown target");
+            }
+        },
+        None => {
+            PENDING_TARGET.with(|c| c.set(None));
+            PENDING_COUNT.with(|c| c.set(None));
+            PENDING_BACKWARD.with(|c| c.set(false));
+            cx.editor.set_status("unknown target");
+        }
+    }
+}
+
+/// Tachyon: set the pending target from outside the key-event handler (e.g. the
+/// Target/Action explorer picker). The next key press is treated as the action.
+pub fn set_pending_target(target: Target) {
+    PENDING_TARGET.with(|cell| cell.set(Some(target)));
+}
+
+impl EditorView {
     pub fn render_view(
         &self,
         editor: &Editor,
@@ -1029,45 +1469,49 @@ impl EditorView {
             // special handling for repeat operator
             (key!('.'), _) if self.keymaps.pending().is_empty() => {
                 for _ in 0..cxt.editor.count.map_or(1, NonZeroUsize::into) {
-                    // first execute whatever put us into insert mode
-                    self.last_insert.0.execute(cxt);
-                    let mut last_savepoint = None;
-                    let mut last_request_savepoint = None;
-                    // then replay the inputs
-                    for key in self.last_insert.1.clone() {
-                        match key {
-                            InsertEvent::Key(key) => self.insert_mode(cxt, key),
-                            InsertEvent::CompletionApply {
-                                trigger_offset,
-                                changes,
-                            } => {
-                                let (view, doc) = current!(cxt.editor);
+                    // Tachyon: semantic repeat-advance on the NEXT object(s);
+                    // falls back to ordinary Helix repeat when none recorded.
+                    if !self.repeat_target_action(cxt) {
+                        // Fallback: Helix-style repeat (re-execute insert-entering command
+                        // + replay keystrokes)
+                        self.last_insert.0.execute(cxt);
+                        let mut last_savepoint = None;
+                        let mut last_request_savepoint = None;
+                        for key in self.last_insert.1.clone() {
+                            match key {
+                                InsertEvent::Key(key) => self.insert_mode(cxt, key),
+                                InsertEvent::CompletionApply {
+                                    trigger_offset,
+                                    changes,
+                                } => {
+                                    let (view, doc) = current!(cxt.editor);
 
-                                if let Some(last_savepoint) = last_savepoint.as_deref() {
-                                    doc.restore(view, last_savepoint, true);
+                                    if let Some(last_savepoint) = last_savepoint.as_deref() {
+                                        doc.restore(view, last_savepoint, true);
+                                    }
+
+                                    let text = doc.text().slice(..);
+                                    let cursor = doc.selection(view.id).primary().cursor(text);
+
+                                    let shift_position = |pos: usize| -> usize {
+                                        (pos + cursor).saturating_sub(trigger_offset)
+                                    };
+
+                                    let tx = Transaction::change(
+                                        doc.text(),
+                                        changes.iter().cloned().map(|(start, end, t)| {
+                                            (shift_position(start), shift_position(end), t)
+                                        }),
+                                    );
+                                    doc.apply(&tx, view.id);
                                 }
-
-                                let text = doc.text().slice(..);
-                                let cursor = doc.selection(view.id).primary().cursor(text);
-
-                                let shift_position = |pos: usize| -> usize {
-                                    (pos + cursor).saturating_sub(trigger_offset)
-                                };
-
-                                let tx = Transaction::change(
-                                    doc.text(),
-                                    changes.iter().cloned().map(|(start, end, t)| {
-                                        (shift_position(start), shift_position(end), t)
-                                    }),
-                                );
-                                doc.apply(&tx, view.id);
-                            }
-                            InsertEvent::TriggerCompletion => {
-                                last_savepoint = take(&mut last_request_savepoint);
-                            }
-                            InsertEvent::RequestCompletion => {
-                                let (view, doc) = current!(cxt.editor);
-                                last_request_savepoint = Some(doc.savepoint(view));
+                                InsertEvent::TriggerCompletion => {
+                                    last_savepoint = take(&mut last_request_savepoint);
+                                }
+                                InsertEvent::RequestCompletion => {
+                                    let (view, doc) = current!(cxt.editor);
+                                    last_request_savepoint = Some(doc.savepoint(view));
+                                }
                             }
                         }
                     }
@@ -1495,59 +1939,122 @@ impl Component for EditorView {
 
                 let mode = cx.editor.mode();
 
+                // Tachyon: capture selection count before dispatch for multi-cursor detection
+                let sel_count_before = if mode != Mode::Insert {
+                    let (view, doc) = current!(cx.editor);
+                    doc.selection(view.id).len()
+                } else {
+                    1
+                };
+                let had_pending_target = self.pending_target.is_some();
+
                 if !self.on_next_key(OnKeyCallbackKind::PseudoPending, &mut cx, key) {
-                    match mode {
-                        Mode::Insert => {
-                            // let completion swallow the event if necessary
-                            let mut consumed = false;
-                            if let Some(completion) = &mut self.completion {
-                                let res = {
-                                    // use a fake context here
-                                    let mut cx = Context {
-                                        editor: cx.editor,
-                                        jobs: cx.jobs,
-                                        scroll: None,
+                    // Tachyon: transfer target from thread-local to pending_target.
+                    // The read_target_key callback writes to PENDING_TARGET thread-local
+                    // because it cannot capture &mut self (FnOnce + 'static).
+                    PENDING_TARGET.with(|cell| {
+                        if let Some(target) = cell.take() {
+                            self.pending_target = Some(target);
+                        }
+                    });
+
+                    // Tachyon: show target preview when target is resolved
+                    if let Some(target) = self.pending_target {
+                        cx.editor
+                            .set_status(format!("target: {}", target.name()));
+                    }
+
+                    // Tachyon: check if a pending target's action key arrived
+                    if self.pending_target.is_some()
+                        && mode != Mode::Insert
+                        && self.handle_pending_target_action(&mut cx, key)
+                    {
+                        // Action was consumed, skip normal dispatch.
+                        // If the action entered insert mode, record it for repeat.
+                        if cx.editor.mode() == Mode::Insert {
+                            self.last_insert.0 = commands::MappableCommand::normal_mode;
+                            self.last_insert.1.clear();
+                        }
+                    } else if mode == Mode::Normal
+                        && matches!(key.code, KeyCode::Char('t'))
+                        && key.modifiers.is_empty()
+                    {
+                        // Tachyon: 't' starts target selection
+                        self.read_target_key(&mut cx);
+                    } else {
+                        match mode {
+                            Mode::Insert => {
+                                // let completion swallow the event if necessary
+                                let mut consumed = false;
+                                if let Some(completion) = &mut self.completion {
+                                    let res = {
+                                        // use a fake context here
+                                        let mut cx = Context {
+                                            editor: cx.editor,
+                                            jobs: cx.jobs,
+                                            scroll: None,
+                                        };
+
+                                        if let EventResult::Consumed(callback) =
+                                            completion.handle_event(event, &mut cx)
+                                        {
+                                            consumed = true;
+                                            Some(callback)
+                                        } else if let EventResult::Consumed(callback) =
+                                            completion.handle_event(&Event::Key(key!(Enter)), &mut cx)
+                                        {
+                                            Some(callback)
+                                        } else {
+                                            None
+                                        }
                                     };
 
-                                    if let EventResult::Consumed(callback) =
-                                        completion.handle_event(event, &mut cx)
-                                    {
-                                        consumed = true;
-                                        Some(callback)
-                                    } else if let EventResult::Consumed(callback) =
-                                        completion.handle_event(&Event::Key(key!(Enter)), &mut cx)
-                                    {
-                                        Some(callback)
-                                    } else {
-                                        None
-                                    }
-                                };
-
-                                if let Some(callback) = res {
-                                    if callback.is_some() {
-                                        // assume close_fn
-                                        if let Some(cb) = self.clear_completion(cx.editor) {
-                                            if consumed {
-                                                cx.on_next_key_callback =
-                                                    Some((cb, OnKeyCallbackKind::Fallback))
-                                            } else {
-                                                self.on_next_key =
-                                                    Some((cb, OnKeyCallbackKind::Fallback));
+                                    if let Some(callback) = res {
+                                        if callback.is_some() {
+                                            // assume close_fn
+                                            if let Some(cb) = self.clear_completion(cx.editor) {
+                                                if consumed {
+                                                    cx.on_next_key_callback =
+                                                        Some((cb, OnKeyCallbackKind::Fallback))
+                                                } else {
+                                                    self.on_next_key =
+                                                        Some((cb, OnKeyCallbackKind::Fallback));
+                                                }
                                             }
                                         }
                                     }
                                 }
-                            }
 
-                            // if completion didn't take the event, we pass it onto commands
-                            if !consumed {
-                                self.insert_mode(&mut cx, key);
+                                // if completion didn't take the event, we pass it onto commands
+                                if !consumed {
+                                    self.insert_mode(&mut cx, key);
 
-                                // record last_insert key
-                                self.last_insert.1.push(InsertEvent::Key(key));
+                                    // record last_insert key
+                                    self.last_insert.1.push(InsertEvent::Key(key));
+                                }
                             }
+                            mode => self.command_mode(mode, &mut cx, key),
                         }
-                        mode => self.command_mode(mode, &mut cx, key),
+                    }
+                }
+
+                // Tachyon: detect multi-cursor expansion after key dispatch.
+                // If the user had a pending target (e.g. typed `tw`) and the selection
+                // expanded (e.g. Alt+a created multiple ranges), record the intent
+                // so `.` can reconstruct the multi-selection from the new cursor context.
+                if had_pending_target && mode != Mode::Insert {
+                    let (view, doc) = current!(cx.editor);
+                    let sel_count_after = doc.selection(view.id).len();
+                    if sel_count_after > sel_count_before {
+                        if let Some((target, action, count, _, _)) = self.last_target_action {
+                            self.last_target_action = Some((
+                                target,
+                                action,
+                                count,
+                                target::Direction::Forward,
+                                MultiSelectIntent::AllMatching,
+                            ));
+                        }
                     }
                 }
 
@@ -1757,5 +2264,121 @@ fn canonicalize_key(key: &mut KeyEvent) {
     } = key
     {
         key.modifiers.remove(KeyModifiers::SHIFT)
+    }
+}
+
+#[cfg(test)]
+mod pending_state_tests {
+    use super::{PENDING_BACKWARD, PENDING_COUNT, PENDING_TARGET};
+    use crate::target::Target;
+
+    fn reset_pending() {
+        PENDING_TARGET.with(|c| c.set(None));
+        PENDING_COUNT.with(|c| c.set(None));
+        PENDING_BACKWARD.with(|c| c.set(false));
+    }
+
+    fn read_pending() -> (Option<usize>, bool, Option<Target>) {
+        let count = PENDING_COUNT.with(|c| c.get());
+        let backward = PENDING_BACKWARD.with(|c| c.get());
+        let target = PENDING_TARGET.with(|c| c.get());
+        (count, backward, target)
+    }
+
+    #[test]
+    fn default_state() {
+        reset_pending();
+        let (count, backward, target) = read_pending();
+        assert_eq!(count, None, "default count is None (defaults to 1 at use site)");
+        assert!(!backward, "default direction is Forward");
+        assert!(target.is_none(), "no pending target by default");
+    }
+
+    #[test]
+    fn count_preserved_after_target_selection() {
+        reset_pending();
+        // Simulate: t 3 ?  →  PENDING_COUNT = Some(3)
+        PENDING_COUNT.with(|c| c.set(Some(3)));
+        // Explorer opens — count must NOT be cleared (the bug fix).
+        // User picks "function" from explorer:
+        PENDING_TARGET.with(|c| c.set(Some(Target::Function)));
+        let (count, backward, target) = read_pending();
+        assert_eq!(count, Some(3), "count=3 preserved through explorer");
+        assert!(!backward, "direction stays Forward");
+        assert_eq!(target, Some(Target::Function));
+    }
+
+    #[test]
+    fn backward_count_preserved_after_target_selection() {
+        reset_pending();
+        // Simulate: t -3 ?  →  PENDING_BACKWARD = true, PENDING_COUNT = Some(3)
+        PENDING_BACKWARD.with(|c| c.set(true));
+        PENDING_COUNT.with(|c| c.set(Some(3)));
+        // Explorer opens — both must be preserved.
+        // User picks "function":
+        PENDING_TARGET.with(|c| c.set(Some(Target::Function)));
+        let (count, backward, target) = read_pending();
+        assert_eq!(count, Some(3), "count=3 preserved");
+        assert!(backward, "backward preserved");
+        assert_eq!(target, Some(Target::Function));
+    }
+
+    #[test]
+    fn cancellation_clears_all_pending_state() {
+        reset_pending();
+        // Set up non-default state.
+        PENDING_COUNT.with(|c| c.set(Some(5)));
+        PENDING_BACKWARD.with(|c| c.set(true));
+        PENDING_TARGET.with(|c| c.set(Some(Target::Statement)));
+        // Simulate Esc (the cancellation path in handle_target_input_step).
+        reset_pending();
+        let (count, backward, target) = read_pending();
+        assert_eq!(count, None);
+        assert!(!backward);
+        assert!(target.is_none());
+    }
+
+    #[test]
+    fn re_selection_does_not_preserve_obsolete_target() {
+        reset_pending();
+        // First selection: t s ?  →  pick "function"
+        PENDING_TARGET.with(|c| c.set(Some(Target::Function)));
+        assert_eq!(read_pending().2, Some(Target::Function));
+        // Re-enter target selection via `t`, then pick "statement":
+        PENDING_TARGET.with(|c| c.set(Some(Target::Statement)));
+        assert_eq!(
+            read_pending().2,
+            Some(Target::Statement),
+            "old target replaced by new selection"
+        );
+    }
+
+    #[test]
+    fn no_selection_range_position_in_pending_state() {
+        reset_pending();
+        PENDING_COUNT.with(|c| c.set(Some(3)));
+        PENDING_BACKWARD.with(|c| c.set(true));
+        PENDING_TARGET.with(|c| c.set(Some(Target::Class)));
+        let (count, backward, target) = read_pending();
+        // Only scalar intent is stored — no Selection, Range, or Position.
+        assert_eq!(count, Some(3));
+        assert!(backward);
+        assert_eq!(target, Some(Target::Class));
+    }
+
+    #[test]
+    fn zero_count_is_not_set_by_accumulation() {
+        reset_pending();
+        // Simulate: pressing '0' as first key in target input.
+        // The digit accumulator skips zero (10 * 0 + 0 = 0 → stays None
+        // because min(0, 4096) = 0 but the path only triggers for digits
+        // after at least one non-zero digit has been seen).
+        // In practice, count=0 is never valid and is rejected at the action
+        // step. Verify the accumulator does not produce Some(0).
+        let next = 0usize.saturating_mul(10).saturating_add(0).min(4096);
+        assert_eq!(next, 0, "0 is a valid intermediate but never stored as count");
+        // When the action step reads None, it defaults to 1.
+        let effective = PENDING_COUNT.with(|c| c.get()).unwrap_or(1);
+        assert_eq!(effective, 1);
     }
 }

@@ -616,6 +616,9 @@ impl MappableCommand {
         goto_prev_tabstop, "Goto next snippet placeholder",
         rotate_selections_first, "Make the first selection your primary one",
         rotate_selections_last, "Make the last selection your primary one",
+        select_all_matching, "Select all occurrences matching current selection",
+        add_selection_below_match, "Add next matching occurrence below to selection",
+        add_selection_above_match, "Add previous matching occurrence above to selection",
     );
 }
 
@@ -3112,7 +3115,7 @@ fn ensure_selections_forward(cx: &mut Context) {
     doc.set_selection(view.id, selection);
 }
 
-fn enter_insert_mode(cx: &mut Context) {
+pub(crate) fn enter_insert_mode(cx: &mut Context) {
     cx.editor.mode = Mode::Insert;
 }
 
@@ -7225,4 +7228,261 @@ fn lsp_or_syntax_workspace_symbol_picker(cx: &mut Context) {
     } else {
         syntax_workspace_symbol_picker(cx);
     }
+}
+
+// Tachyon: Multi-cursor commands
+
+/// Select all occurrences of the current primary selection text in the document.
+fn select_all_matching(cx: &mut Context) {
+    use helix_stdx::rope::RopeSliceExt;
+
+    let (view, doc) = current!(cx.editor);
+    let text = doc.text().slice(..);
+    let selection = doc.selection(view.id);
+    let primary = selection.primary();
+
+    // Get the text of the primary selection
+    let selected_text: String = primary.fragment(text).into_owned();
+    if selected_text.is_empty() {
+        return;
+    }
+
+    // Escape as regex literal and build a regex
+    let escaped = helix_core::regex::escape(&selected_text);
+    let regex = match helix_stdx::rope::RegexBuilder::new().build(&escaped) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    // Search the entire document
+    let mut ranges: SmallVec<[Range; 1]> = SmallVec::new();
+    for mat in regex.find_iter(text.regex_input_at(0..text.len_chars())) {
+        let start = text.byte_to_char(mat.start());
+        let end = text.byte_to_char(mat.end());
+        ranges.push(Range::new(start, end));
+    }
+
+    if ranges.is_empty() {
+        return;
+    }
+
+    // Find the index of the range that contains the original primary cursor
+    let primary_pos = primary.head;
+    let primary_index = ranges
+        .iter()
+        .position(|r| r.from() <= primary_pos && r.to() >= primary_pos)
+        .unwrap_or(0);
+
+    doc.set_selection(view.id, Selection::new(ranges, primary_index));
+}
+
+/// Add the next occurrence of the current primary selection text below to the selection.
+fn add_selection_below_match(cx: &mut Context) {
+    use helix_stdx::rope::RopeSliceExt;
+
+    let (view, doc) = current!(cx.editor);
+    let text = doc.text().slice(..);
+    let selection = doc.selection(view.id);
+    let primary = selection.primary();
+
+    let selected_text: String = primary.fragment(text).into_owned();
+    if selected_text.is_empty() {
+        return;
+    }
+
+    let escaped = helix_core::regex::escape(&selected_text);
+    let regex = match helix_stdx::rope::RegexBuilder::new().build(&escaped) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    // Search after the end of the current primary selection
+    let search_start = primary.to();
+    if search_start >= text.len_chars() {
+        return;
+    }
+
+    if let Some(mat) = regex.find(text.regex_input_at(search_start..text.len_chars())) {
+        let start = text.byte_to_char(mat.start());
+        let end = text.byte_to_char(mat.end());
+        let new_range = Range::new(start, end);
+        let new_selection = selection.clone().push(new_range);
+        doc.set_selection(view.id, new_selection);
+    }
+}
+
+/// Add the previous occurrence of the current primary selection text above to the selection.
+fn add_selection_above_match(cx: &mut Context) {
+    use helix_stdx::rope::RopeSliceExt;
+
+    let (view, doc) = current!(cx.editor);
+    let text = doc.text().slice(..);
+    let selection = doc.selection(view.id);
+    let primary = selection.primary();
+
+    let selected_text: String = primary.fragment(text).into_owned();
+    if selected_text.is_empty() {
+        return;
+    }
+
+    let escaped = helix_core::regex::escape(&selected_text);
+    let regex = match helix_stdx::rope::RegexBuilder::new().build(&escaped) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    // Search before the start of the current primary selection
+    let search_end = primary.from();
+    if search_end == 0 {
+        return;
+    }
+
+    // Collect all matches before the current selection, take the last one (closest above)
+    let mut last_match = None;
+    for mat in regex.find_iter(text.regex_input_at(0..search_end)) {
+        let start = text.byte_to_char(mat.start());
+        let end = text.byte_to_char(mat.end());
+        last_match = Some(Range::new(start, end));
+    }
+
+    if let Some(new_range) = last_match {
+        let new_selection = selection.clone().push(new_range);
+        doc.set_selection(view.id, new_selection);
+    }
+}
+
+// ============================================================
+// Tachyon: discoverable Target / Action explorer
+// ============================================================
+
+/// Tachyon: a single row of the discoverable Target/Action reference shown by
+/// `:tachyon-help` (alias `:th`) and by `t ?`. Selecting a target resumes the
+/// `t <target> <action>` flow; selecting an action explains its usage.
+pub struct TachyonHelpItem {
+    pub kind: &'static str,
+    pub key: String,
+    pub name: &'static str,
+    pub desc: &'static str,
+    pub target: Option<crate::target::Target>,
+    pub action: Option<crate::target::Action>,
+}
+
+fn tachyon_help_kind<'a>(item: &'a TachyonHelpItem, _: &'a ()) -> Cell<'a> {
+    Cell::from(item.kind)
+}
+
+fn tachyon_help_key<'a>(item: &'a TachyonHelpItem, _: &'a ()) -> Cell<'a> {
+    Cell::from(item.key.as_str())
+}
+
+fn tachyon_help_name<'a>(item: &'a TachyonHelpItem, _: &'a ()) -> Cell<'a> {
+    Cell::from(item.name)
+}
+
+fn tachyon_help_desc<'a>(item: &'a TachyonHelpItem, _: &'a ()) -> Cell<'a> {
+    Cell::from(item.desc)
+}
+
+/// Tachyon: open a fuzzy picker listing every Target and Action with its key
+/// and a short description. This is the discoverability surface for the
+/// `t <target> <action>` editing model - no key needs to be memorized.
+///
+/// When `prefix` is `Some`, the Explorer displays the active semantic prefix
+/// (e.g. `"t 3"` or `"t -3 function"`) to make it clear what selecting an
+/// item will complete.
+pub fn tachyon_help_cmd(cx: &mut Context, prefix: Option<&str>) {
+    use crate::ui::overlay::overlaid;
+    use crate::ui::picker::{Column as PickerColumn, Picker};
+
+    let mut items: Vec<TachyonHelpItem> = Vec::new();
+    for (name, key, desc) in crate::target::Target::targets_help() {
+        items.push(TachyonHelpItem {
+            kind: "target",
+            key: key.to_string(),
+            name,
+            desc,
+            target: crate::target::Target::from_key(*key),
+            action: None,
+        });
+    }
+    for (name, key, desc) in crate::target::Action::actions_help() {
+        items.push(TachyonHelpItem {
+            kind: "action",
+            key: key.to_string(),
+            name,
+            desc,
+            target: None,
+            action: crate::target::Action::from_key(*key),
+        });
+    }
+    // Discoverable note: an optional count/direction multiplies the scope.
+    items.push(TachyonHelpItem {
+        kind: "count",
+        key: "N".to_string(),
+        name: "optional",
+        desc: "[N|-N] before target, e.g. t 3 f d / t -2 n d / t 2 s c",
+        target: None,
+        action: None,
+    });
+    // Discoverable note: `.` repeats on the NEXT semantic object.
+    items.push(TachyonHelpItem {
+        kind: "repeat",
+        key: ".".to_string(),
+        name: "semantic repeat",
+        desc: "repeat the last t <target> <action> on the next semantic target",
+        target: None,
+        action: None,
+    });
+    // Discoverable note: `?` opens the explorer retaining count/direction.
+    items.push(TachyonHelpItem {
+        kind: "explorer",
+        key: "?".to_string(),
+        name: "semantic explorer",
+        desc: "open this list; retains prefix, e.g. t 3 ? → pick target → action",
+        target: None,
+        action: None,
+    });
+
+    let columns = [
+        PickerColumn::new("kind", tachyon_help_kind),
+        PickerColumn::new("key", tachyon_help_key),
+        PickerColumn::new("name", tachyon_help_name),
+        PickerColumn::new("description", tachyon_help_desc),
+    ];
+
+    let mut picker = Picker::new(columns, 3, items, (), |cx, item, _action| {
+        match item.target {
+            Some(t) => {
+                crate::ui::editor::set_pending_target(t);
+                cx.editor.set_status(format!(
+                    "target: {} — press an action key (d/c/y/>/<)",
+                    t.name()
+                ));
+            }
+            None => {
+                if item.kind == "count" {
+                    cx.editor.set_status(
+                        "count: [N|-N] before target — t 3 s d (next) / t -3 f d (prev) / t 2 s c",
+                    );
+                } else if item.kind == "repeat" {
+                    cx.editor.set_status(
+                        ". repeats the last t <target> <action> on the next semantic target",
+                    );
+                } else if item.kind == "explorer" {
+                    cx.editor.set_status(
+                        "?: open this list; retains prefix (t 3 ? → pick target → action key)",
+                    );
+                } else {
+                    cx.editor.set_status(format!(
+                        "action: {} — use after a target (t <target> <action>)",
+                        item.name
+                    ));
+                }
+            }
+        }
+    });
+    if let Some(prefix) = prefix {
+        picker.set_prompt(prefix);
+    }
+    cx.push_layer(Box::new(overlaid(picker)));
 }

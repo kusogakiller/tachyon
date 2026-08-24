@@ -2941,6 +2941,32 @@ fn read(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
     Ok(())
 }
 
+/// Tachyon: Execute a shell command and insert its stdout before each selection.
+/// Usage: `:read-shell <command>` or `:r! <command>`
+fn read_shell(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let scrolloff = cx.editor.config().scrolloff;
+    let shell = cx.editor.config().shell.clone();
+    let cmd = args.join(" ");
+
+    let output = tokio::task::block_in_place(|| {
+        helix_lsp::block_on(shell_impl_async(&shell, &cmd, None))
+    })?;
+
+    let (view, doc) = current!(cx.editor);
+    let output = Tendril::from(output);
+    let selection = doc.selection(view.id);
+    let transaction = Transaction::insert(doc.text(), selection, output);
+    doc.apply(&transaction, view.id);
+    doc.append_changes_to_history(view);
+    view.ensure_cursor_in_view(doc, scrolloff);
+
+    Ok(())
+}
+
 fn echo(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
@@ -4064,6 +4090,14 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
+        name: "read-shell",
+        aliases: &["r!"],
+        doc: "Execute shell command and insert output before selections",
+        fun: read_shell,
+        completer: SHELL_COMPLETER,
+        signature: SHELL_SIGNATURE,
+    },
+    TypableCommand {
         name: "echo",
         aliases: &[],
         doc: "Prints the given arguments to the statusline.",
@@ -4108,7 +4142,128 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         fun: exclude_workspace,
         completer: CommandCompleter::none(),
         signature: Signature { positionals: (0, None), ..Signature::DEFAULT },
-    }
+    },
+    // Tachyon AI commands
+    TypableCommand {
+        name: "ai-connect",
+        aliases: &[],
+        doc: "Connect to an AI provider (zen, go).",
+        fun: ai_connect_cmd,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (1, Some(2)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "ai-model",
+        aliases: &[],
+        doc: "List and select available AI models.",
+        fun: ai_model_cmd,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "ai-set-model",
+        aliases: &[],
+        doc: "Set the AI model directly by name.",
+        fun: ai_set_model_cmd,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (1, Some(1)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "ai",
+        aliases: &[],
+        doc: "Send a prompt to the configured AI model.",
+        fun: ai_prompt_cmd,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (1, None), raw_after: Some(0), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "ai-status",
+        aliases: &[],
+        doc: "Show current AI configuration status.",
+        fun: ai_status_cmd,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "ai-explain",
+        aliases: &["aex"],
+        doc: "Explain the current semantic target using AI.",
+        fun: ai_explain_cmd,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "ai-review",
+        aliases: &["ar"],
+        doc: "Review the current function using AI.",
+        fun: ai_review_cmd,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "ai-fix",
+        aliases: &["af"],
+        doc: "Suggest fixes for the current expression using AI.",
+        fun: ai_fix_cmd,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "ai-debug",
+        aliases: &["ad"],
+        doc: "Debug compiler/runtime issues using AI.",
+        fun: ai_debug_cmd,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "ai-doc",
+        aliases: &[],
+        doc: "Generate documentation suggestions using AI.",
+        fun: ai_doc_cmd,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "ai-review-diff",
+        aliases: &["ard"],
+        doc: "Review git changes in the current file using AI.",
+        fun: ai_review_diff_cmd,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "ai-apply",
+        aliases: &[],
+        doc: "Apply the last AI suggestion (Target + Action) at the current cursor. Optional 1-based index: :ai-apply <n>.",
+        fun: ai_apply_cmd,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(1)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "ai-suggest",
+        aliases: &["as"],
+        doc: "Ask the AI to propose applicable Target -> Action improvements for the code at the cursor. Optional: :ai-suggest [target] [action].",
+        fun: ai_suggest_cmd,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(2)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "tachyon-help",
+        aliases: &["th"],
+        doc: "Open the discoverable Target / Action explorer for the t <target> <action> editing model.",
+        fun: tachyon_help_command,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "ai-preview",
+        aliases: &["ap"],
+        doc: "Read-only preview of where stored AI suggestions would resolve at the current cursor. Optional 1-based index: :ai-preview [n]. No argument previews all suggestions.",
+        fun: ai_preview_cmd,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(1)), ..Signature::DEFAULT },
+    },
 ];
 
 pub static TYPABLE_COMMAND_MAP: Lazy<HashMap<&'static str, &'static TypableCommand>> =
@@ -4605,4 +4760,177 @@ fn exclude_workspace(
     cx.editor.workspace_trust.exclude(&workspace);
     cx.editor.config_events.0.send(ConfigEvent::Refresh)?;
     Ok(())
+}
+
+// Tachyon AI command wrappers
+
+fn ai_connect_cmd(
+    cx: &mut compositor::Context,
+    args: Args<'_>,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    crate::ai::commands::ai_connect(cx, args, event)
+}
+
+fn ai_model_cmd(
+    cx: &mut compositor::Context,
+    args: Args<'_>,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    crate::ai::commands::ai_model(cx, args, event)
+}
+
+fn ai_set_model_cmd(
+    cx: &mut compositor::Context,
+    args: Args<'_>,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    crate::ai::commands::ai_set_model(cx, args, event)
+}
+
+fn ai_prompt_cmd(
+    cx: &mut compositor::Context,
+    args: Args<'_>,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    crate::ai::commands::ai_prompt(cx, args, event)
+}
+
+fn ai_status_cmd(
+    cx: &mut compositor::Context,
+    args: Args<'_>,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    crate::ai::commands::ai_status(cx, args, event)
+}
+
+fn ai_explain_cmd(
+    cx: &mut compositor::Context,
+    args: Args<'_>,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    crate::ai::commands::ai_explain(cx, args, event)
+}
+
+fn ai_review_cmd(
+    cx: &mut compositor::Context,
+    args: Args<'_>,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    crate::ai::commands::ai_review(cx, args, event)
+}
+
+fn ai_fix_cmd(
+    cx: &mut compositor::Context,
+    args: Args<'_>,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    crate::ai::commands::ai_fix(cx, args, event)
+}
+
+fn ai_debug_cmd(
+    cx: &mut compositor::Context,
+    args: Args<'_>,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    crate::ai::commands::ai_debug(cx, args, event)
+}
+
+fn ai_doc_cmd(
+    cx: &mut compositor::Context,
+    args: Args<'_>,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    crate::ai::commands::ai_doc(cx, args, event)
+}
+
+fn ai_review_diff_cmd(
+    cx: &mut compositor::Context,
+    args: Args<'_>,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    crate::ai::commands::ai_review_diff(cx, args, event)
+}
+
+fn ai_apply_cmd(
+    cx: &mut compositor::Context,
+    args: Args<'_>,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    crate::ai::commands::ai_apply(cx, args, event)
+}
+
+fn ai_suggest_cmd(
+    cx: &mut compositor::Context,
+    args: Args<'_>,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    crate::ai::commands::ai_suggest(cx, args, event)
+}
+
+fn tachyon_help_command(
+    cx: &mut compositor::Context,
+    _args: Args<'_>,
+    _event: PromptEvent,
+) -> anyhow::Result<()> {
+    let mut cmd_cx = crate::commands::Context {
+        register: None,
+        count: None,
+        editor: cx.editor,
+        callback: Vec::new(),
+        on_next_key_callback: None,
+        jobs: cx.jobs,
+    };
+    crate::commands::tachyon_help_cmd(&mut cmd_cx, None);
+    Ok(())
+}
+
+fn ai_preview_cmd(
+    cx: &mut compositor::Context,
+    args: Args<'_>,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    crate::ai::commands::ai_preview(cx, args, event)
 }

@@ -15,9 +15,10 @@ mod test {
         Ok(())
     }
 
-    mod auto_pairs;
-    mod command_line;
-    mod commands;
-    mod movement;
-    mod splits;
+mod auto_pairs;
+mod command_line;
+mod commands;
+mod movement;
+mod splits;
+mod tachyon_smoke;
 }

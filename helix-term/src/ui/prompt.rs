@@ -112,6 +112,12 @@ impl Prompt {
         self.cursor
     }
 
+    /// Set the prompt prefix text displayed at the left of the input line.
+    /// Used by the Tachyon Explorer to show the active semantic prefix.
+    pub fn set_prefix(&mut self, prefix: &str) {
+        self.prompt = std::borrow::Cow::Owned(prefix.to_string());
+    }
+
     pub fn with_line(mut self, line: String, editor: &Editor) -> Self {
         self.set_line(line, editor);
         self

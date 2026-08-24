@@ -7,8 +7,9 @@ use crate::graphemes::{next_grapheme_boundary, prev_grapheme_boundary};
 use crate::line_ending::rope_is_line_ending;
 use crate::movement::Direction;
 use crate::syntax;
+use crate::syntax::CapturedNode;
 use crate::Range;
-use crate::{surround, Syntax};
+use crate::{surround, tree_sitter, Syntax};
 
 fn find_word_boundary(slice: RopeSlice, mut pos: usize, direction: Direction, long: bool) -> usize {
     use CharCategory::{Eol, Whitespace};
@@ -264,32 +265,109 @@ pub fn textobject_treesitter(
     loader: &syntax::Loader,
     _count: usize,
 ) -> Range {
+    textobject_treesitter_captured(slice, range, textobject, object_name, syntax, loader)
+        .unwrap_or(range)
+}
+
+/// Tree-sitter textobject lookup with EXACT miss reporting: returns `None`
+/// when no `{object_name}.{textobject}` capture covers the cursor, instead of
+/// silently falling back to the input range. Callers that must distinguish a
+/// real semantic capture from the fallback (e.g. traversal engines that skip
+/// gaps) use this; plain resolution keeps the `unwrap_or` contract above.
+pub fn textobject_treesitter_captured(
+    slice: RopeSlice,
+    range: Range,
+    textobject: TextObject,
+    object_name: &str,
+    syntax: &Syntax,
+    loader: &syntax::Loader,
+) -> Option<Range> {
     let byte_pos = slice.char_to_byte(range.cursor(slice));
     let layer = syntax.layer_for_byte_range(byte_pos as u32, byte_pos as u32);
     let root = syntax
         .tree_for_byte_range(byte_pos as u32, byte_pos as u32)
         .root_node();
     let textobject_query = loader.textobject_query(syntax.layer(layer).language);
-    let get_range = move || -> Option<Range> {
-        let capture_name = format!("{}.{}", object_name, textobject); // eg. function.inner
-        let node = textobject_query?
-            .capture_nodes(&capture_name, &root, slice)?
-            .filter(|node| node.byte_range().contains(&byte_pos))
-            .min_by_key(|node| node.byte_range().len())?;
+    let capture_name = format!("{}.{}", object_name, textobject); // eg. function.inner
+    let node = textobject_query?
+        .capture_nodes(&capture_name, &root, slice)?
+        .filter(|node| node.byte_range().contains(&byte_pos))
+        .min_by_key(|node| node.byte_range().len())?;
 
-        let len = slice.len_bytes();
-        let start_byte = node.start_byte();
-        let end_byte = node.end_byte();
-        if start_byte >= len || end_byte >= len {
-            return None;
-        }
+    let len = slice.len_bytes();
+    let start_byte = node.start_byte();
+    let end_byte = node.end_byte();
+    if start_byte >= len || end_byte >= len {
+        return None;
+    }
 
-        let start_char = slice.byte_to_char(start_byte);
-        let end_char = slice.byte_to_char(end_byte);
+    let start_char = slice.byte_to_char(start_byte);
+    let end_char = slice.byte_to_char(end_byte);
 
-        Some(Range::new(start_char, end_char))
+    Some(Range::new(start_char, end_char))
+}
+
+/// Sibling-separator inspection for a `{object_name}.inside` capture.
+///
+/// Locates the innermost capture covering `range`'s cursor and reports its
+/// immediately adjacent separator tokens inside the enclosing list node as
+/// CHAR spans: `(capture, following_separator, preceding_separator)`.
+///
+/// A separator is a direct sibling whose node kind is `,` — mirroring the
+/// repository's own textobject query contract (`. ","? @x.around`), so this
+/// never guesses about punctuation from raw text. `None` means no capture
+/// covers the position.
+pub fn textobject_capture_sibling_separators(
+    slice: RopeSlice,
+    range: Range,
+    object_name: &str,
+    syntax: &Syntax,
+    loader: &syntax::Loader,
+) -> Option<(Range, Option<(usize, usize)>, Option<(usize, usize)>)> {
+    let byte_pos = slice.char_to_byte(range.cursor(slice));
+    let layer = syntax.layer_for_byte_range(byte_pos as u32, byte_pos as u32);
+    let root = syntax
+        .tree_for_byte_range(byte_pos as u32, byte_pos as u32)
+        .root_node();
+    let query = loader.textobject_query(syntax.layer(layer).language)?;
+    let capture_name = format!("{}.inside", object_name);
+    let captured = query
+        .capture_nodes(&capture_name, &root, slice)?
+        .filter(|node| node.byte_range().contains(&byte_pos))
+        .min_by_key(|node| node.byte_range().len())?;
+
+    // Raw node for sibling navigation; byte offsets are u32 on this type.
+    let bp = byte_pos as u32;
+    let node = match captured {
+        CapturedNode::Single(n) => n,
+        CapturedNode::Grouped(ns) => ns
+            .into_iter()
+            .find(|n| n.start_byte() <= bp && bp < n.end_byte())?,
     };
-    get_range().unwrap_or(range)
+    let char_span = |n: tree_sitter::Node| -> (usize, usize) {
+        (
+            slice.byte_to_char(n.start_byte() as usize),
+            slice.byte_to_char(n.end_byte() as usize),
+        )
+    };
+
+    let next_sep = node
+        .next_sibling()
+        .filter(|s| s.kind() == ",")
+        .map(char_span);
+    let prev_sep = node
+        .prev_sibling()
+        .filter(|s| s.kind() == ",")
+        .map(char_span);
+
+    Some((
+        Range::new(
+            slice.byte_to_char(node.start_byte() as usize),
+            slice.byte_to_char(node.end_byte() as usize),
+        ),
+        next_sep,
+        prev_sep,
+    ))
 }
 
 #[cfg(test)]
